@@ -1,0 +1,673 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum UserRole {
+  GUEST      // обычный пользователь
+  HOST       // сдаёт жильё
+  ADMIN      // модерация
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum PropertyType {
+  APARTMENT
+  STUDIO
+  HOUSE
+  ROOM
+  LOFT
+  TOWNHOUSE
+}
+
+enum PropertyStatus {
+  DRAFT
+  PENDING_REVIEW
+  PUBLISHED
+  PAUSED
+  REJECTED
+  ARCHIVED
+}
+
+enum BookingStatus {
+  PENDING          // создано, ждёт оплаты
+  CONFIRMED        // оплачено, активно
+  CANCELLED_BY_GUEST
+  CANCELLED_BY_HOST
+  COMPLETED        // проживание завершено
+  EXPIRED          // не оплачено вовремя
+  NO_SHOW
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  DISPUTED
+}
+
+enum PayoutStatus {
+  PENDING
+  IN_TRANSIT
+  PAID
+  FAILED
+  REVERSED
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSED
+  REJECTED
+}
+
+enum NotificationChannel {
+  EMAIL
+  PUSH
+  IN_APP
+}
+
+enum NotificationType {
+  BOOKING_CREATED
+  BOOKING_CONFIRMED
+  BOOKING_CANCELLED
+  BOOKING_REMINDER
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  REFUND_PROCESSED
+  REVIEW_RECEIVED
+  NEW_MESSAGE
+  PAYOUT_SENT
+  WELCOME
+  PASSWORD_RESET
+  EMAIL_VERIFICATION
+}
+
+// ============================================================
+// AUTH (совместимо с Better Auth)
+// ============================================================
+
+model User {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  emailVerified Boolean    @default(false)
+  name          String?
+  image         String?    // аватар (ImageKit URL)
+  phone         String?
+  role          UserRole   @default(GUEST)
+  status        UserStatus @default(ACTIVE)
+
+  // Stripe
+  stripeCustomerId String? @unique
+
+  // Профиль
+  bio         String? @db.Text
+  locale      String  @default("ru")
+  timezone    String  @default("Europe/Moscow")
+
+  // Метаданные
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  // Relations
+  sessions      Session[]
+  accounts      Account[]
+  properties    Property[]     @relation("HostProperties")
+  bookings      Booking[]      @relation("GuestBookings")
+  reviewsAuthored Review[]     @relation("AuthorReviews")
+  reviewsReceived Review[]     @relation("TargetReviews")
+  messages      Message[]
+  conversations ConversationMember[]
+  notifications Notification[]
+  payouts       Payout[]
+  favorites     Favorite[]
+
+  @@index([email])
+  @@index([role, status])
+}
+
+// Better Auth: Session
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// Better Auth: Account (OAuth / credentials)
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String    // "credential" | "google" | "github" ...
+  accessToken           String?   @db.Text
+  refreshToken          String?   @db.Text
+  idToken               String?   @db.Text
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?   // hash для credential
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+}
+
+// Better Auth: Verification tokens (email verify, reset password)
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+// ============================================================
+// PROPERTY (объявления)
+// ============================================================
+
+model Property {
+  id          String         @id @default(cuid())
+  hostId      String
+  title       String
+  slug        String         @unique
+  description String         @db.Text
+  type        PropertyType
+  status      PropertyStatus @default(DRAFT)
+
+  // Адрес
+  country     String
+  city        String
+  region      String?
+  street      String?
+  building    String?
+  apartment   String?
+  postalCode  String?
+  latitude    Float?
+  longitude   Float?
+
+  // Вместимость
+  maxGuests  Int
+  bedrooms   Int @default(1)
+  beds       Int @default(1)
+  bathrooms  Float @default(1)
+  areaSqm    Float?
+
+  // Условия
+  minNights       Int     @default(1)
+  maxNights       Int     @default(365)
+  checkInTime     String  @default("15:00")
+  checkOutTime    String  @default("11:00")
+  instantBook     Boolean @default(false)
+  smokingAllowed  Boolean @default(false)
+  petsAllowed     Boolean @default(false)
+  partiesAllowed  Boolean @default(false)
+
+  // Цены (в минимальных единицах валюты, копейки/центы)
+  basePricePerNight Int
+  cleaningFee       Int    @default(0)
+  securityDeposit   Int    @default(0)
+  currency          String @default("USD")
+
+  // Рейтинг (денормализация)
+  avgRating   Float @default(0)
+  reviewsCount Int  @default(0)
+  bookingsCount Int @default(0)
+
+  // Модерация
+  rejectionReason String?
+  publishedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  // Relations
+  host          User             @relation("HostProperties", fields: [hostId], references: [id])
+  images        PropertyImage[]
+  amenities     PropertyAmenity[]
+  availability  Availability[]
+  pricingRules  PricingRule[]
+  bookings      Booking[]
+  reviews       Review[]
+  favorites     Favorite[]
+
+  @@index([hostId, status])
+  @@index([city, status])
+  @@index([latitude, longitude])
+  @@index([status, publishedAt])
+}
+
+model PropertyImage {
+  id         String   @id @default(cuid())
+  propertyId String
+  imageKitId String   @unique
+  url        String
+  thumbnail  String?
+  alt        String?
+  order      Int      @default(0)
+  isCover    Boolean  @default(false)
+  width      Int?
+  height     Int?
+  sizeBytes  Int?
+  createdAt  DateTime @default(now())
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@index([propertyId, order])
+}
+
+model Amenity {
+  id       String            @id @default(cuid())
+  code     String            @unique // "wifi", "kitchen", "ac"
+  name     String
+  icon     String?
+  category String?
+  properties PropertyAmenity[]
+}
+
+model PropertyAmenity {
+  propertyId String
+  amenityId  String
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  amenity  Amenity  @relation(fields: [amenityId], references: [id], onDelete: Cascade)
+
+  @@id([propertyId, amenityId])
+  @@index([amenityId])
+}
+
+// Календарь доступности (по дням)
+model Availability {
+  id         String   @id @default(cuid())
+  propertyId String
+  date       DateTime @db.Date
+  isAvailable Boolean @default(true)
+  // цена за конкретный день (override basePricePerNight)
+  priceOverride Int?
+  minNightsOverride Int?
+  note       String?
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@unique([propertyId, date])
+  @@index([propertyId, date])
+}
+
+// Правила ценообразования (сезонные, weekend, длительное проживание)
+model PricingRule {
+  id          String   @id @default(cuid())
+  propertyId  String
+  name        String
+  type        PricingRuleType
+  startDate   DateTime? @db.Date
+  endDate     DateTime? @db.Date
+  // Для WEEKEND: 0..6 (вс..сб)
+  daysOfWeek  Int[]
+  minNights   Int?
+  // MULTIPLIER: множитель 1.2; FIXED: абсолютная цена
+  multiplier  Float?
+  fixedPrice  Int?
+  priority    Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@index([propertyId, isActive])
+}
+
+enum PricingRuleType {
+  SEASONAL
+  WEEKEND
+  HOLIDAY
+  LAST_MINUTE
+  LONG_STAY
+  CUSTOM
+}
+
+// ============================================================
+// BOOKING
+// ============================================================
+
+model Booking {
+  id            String        @id @default(cuid())
+  code          String        @unique // человекочитаемый: BK-2025-XXXXXX
+  propertyId    String
+  guestId       String
+  hostId        String
+
+  checkIn       DateTime      @db.Date
+  checkOut      DateTime      @db.Date
+  nights        Int
+  guests        Int
+  adults        Int           @default(1)
+  children      Int           @default(0)
+  infants       Int           @default(0)
+
+  status        BookingStatus @default(PENDING)
+
+  // Финансы (в минимальных единицах)
+  currency            String
+  pricePerNight       Int
+  nightsTotal         Int    // сумма за ночи
+  cleaningFee         Int    @default(0)
+  serviceFee          Int    @default(0) // комиссия платформы
+  taxes               Int    @default(0)
+  discount            Int    @default(0)
+  totalAmount         Int
+  hostPayoutAmount    Int    // сколько получит хост
+
+  // Snapshot данных (на случай изменения объявления)
+  propertySnapshot    Json?
+  guestSnapshot       Json?
+
+  // Комментарии
+  guestMessage        String? @db.Text
+  cancellationReason  String?
+
+  // Тайминги
+  expiresAt           DateTime? // дедлайн оплаты для PENDING
+  confirmedAt         DateTime?
+  cancelledAt         DateTime?
+  completedAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  property   Property    @relation(fields: [propertyId], references: [id])
+  guest      User        @relation("GuestBookings", fields: [guestId], references: [id])
+  payments   Payment[]
+  refunds    Refund[]
+  review     Review?
+  conversation Conversation?
+
+  @@index([propertyId, checkIn, checkOut])
+  @@index([guestId, status])
+  @@index([hostId, status])
+  @@index([status, expiresAt])
+  @@index([createdAt])
+}
+
+// ============================================================
+// PAYMENTS / STRIPE
+// ============================================================
+
+model Payment {
+  id            String        @id @default(cuid())
+  bookingId     String
+  userId        String?       // плательщик
+
+  // Stripe
+  stripePaymentIntentId String? @unique
+  stripeChargeId        String? @unique
+  stripeCustomerId      String?
+
+  amount        Int
+  currency      String
+  status        PaymentStatus @default(PENDING)
+  method        String?       // card, sepa_debit ...
+  description   String?
+
+  // Идемпотентность
+  idempotencyKey String? @unique
+
+  failureReason String?
+  metadata      Json?
+
+  paidAt        DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  refunds  Refund[]
+
+  @@index([bookingId])
+  @@index([status])
+  @@index([stripePaymentIntentId])
+}
+
+model Refund {
+  id            String       @id @default(cuid())
+  bookingId     String
+  paymentId     String?
+
+  stripeRefundId String?     @unique
+  amount         Int
+  currency       String
+  status         RefundStatus @default(REQUESTED)
+  reason         String?
+  adminNote      String?
+
+  processedAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  booking Booking  @relation(fields: [bookingId], references: [id])
+  payment Payment? @relation(fields: [paymentId], references: [id])
+
+  @@index([bookingId])
+  @@index([status])
+}
+
+model Payout {
+  id           String       @id @default(cuid())
+  hostId       String
+  bookingId    String?      // если выплата за конкретный booking
+
+  stripeTransferId String?  @unique
+  amount       Int
+  currency     String
+  status       PayoutStatus @default(PENDING)
+
+  scheduledFor DateTime?
+  paidAt       DateTime?
+  failureReason String?
+  metadata     Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  host User @relation(fields: [hostId], references: [id])
+
+  @@index([hostId, status])
+  @@index([scheduledFor])
+}
+
+// Webhook events от Stripe (для идемпотентной обработки)
+model StripeWebhookEvent {
+  id          String   @id @default(cuid())
+  eventId     String   @unique
+  type        String
+  payload     Json
+  processed   Boolean  @default(false)
+  processedAt DateTime?
+  error       String?
+  createdAt   DateTime @default(now())
+
+  @@index([type, processed])
+}
+
+// ============================================================
+// REVIEWS
+// ============================================================
+
+model Review {
+  id          String   @id @default(cuid())
+  bookingId   String   @unique
+  propertyId  String
+  authorId    String
+  targetId    String   // кому адресован (host или guest)
+
+  // Оценки 1..5
+  ratingOverall  Int
+  ratingClean    Int?
+  ratingAccuracy Int?
+  ratingCheckIn  Int?
+  ratingLocation Int?
+  ratingValue    Int?
+  ratingComm     Int?
+
+  comment     String   @db.Text
+  hostReply   String?  @db.Text
+  hostReplyAt DateTime?
+
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  booking  Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  property Property @relation(fields: [propertyId], references: [id])
+  author   User     @relation("AuthorReviews", fields: [authorId], references: [id])
+  target   User     @relation("TargetReviews", fields: [targetId], references: [id])
+
+  @@index([propertyId, isPublished])
+  @@index([targetId])
+  @@index([authorId])
+}
+
+// ============================================================
+// MESSAGING
+// ============================================================
+
+model Conversation {
+  id         String   @id @default(cuid())
+  bookingId  String?  @unique
+  title      String?
+  lastMessageAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  booking  Booking?            @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  members  ConversationMember[]
+  messages Message[]
+
+  @@index([lastMessageAt])
+}
+
+model ConversationMember {
+  conversationId String
+  userId         String
+  lastReadAt     DateTime?
+  joinedAt       DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([conversationId, userId])
+  @@index([userId])
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  conversationId String
+  senderId       String
+  body           String   @db.Text
+  attachments    Json?    // [{ type, url, name }]
+  readAt         DateTime?
+  createdAt      DateTime @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User         @relation(fields: [senderId], references: [id])
+
+  @@index([conversationId, createdAt])
+  @@index([senderId])
+}
+
+// ============================================================
+// NOTIFICATIONS (Resend/email + in-app)
+// ============================================================
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  type      NotificationType
+  channel   NotificationChannel @default(IN_APP)
+  title     String
+  body      String              @db.Text
+  data      Json?
+  readAt    DateTime?
+  sentAt    DateTime?
+  error     String?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([channel, sentAt])
+}
+
+// ============================================================
+// FAVORITES
+// ============================================================
+
+model Favorite {
+  userId     String
+  propertyId String
+  createdAt  DateTime @default(now())
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  property Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+
+  @@id([userId, propertyId])
+  @@index([userId, createdAt])
+}
+
+// ============================================================
+// AUDIT LOG (для админов и разбора инцидентов)
+// ============================================================
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String   // "booking.cancel", "user.suspend"
+  entityType String   // "Booking", "User"
+  entityId   String?
+  before     Json?
+  after      Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId, createdAt])
+}
