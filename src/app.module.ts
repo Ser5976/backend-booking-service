@@ -5,6 +5,7 @@ import { ConfigModule } from '@nestjs/config';
 import { PrismaModule } from './prisma/prisma.module.js';
 import { AuthModule } from '@thallesp/nestjs-better-auth';
 import { auth } from './auth.js';
+import { StripeService } from './stripe/stripe.service.js';
 
 @Module({
   imports: [
@@ -13,6 +14,6 @@ import { auth } from './auth.js';
     AuthModule.forRoot({ auth: auth }),
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [AppService, StripeService],
 })
 export class AppModule {}
