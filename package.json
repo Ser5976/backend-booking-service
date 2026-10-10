@@ -7,7 +7,6 @@
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
-    "prebuild": "rimraf dist",
     "postinstall": "prisma generate",
     "build": "nest build",
     "deploy": "nest deploy",
