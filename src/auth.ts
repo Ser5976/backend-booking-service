@@ -1,5 +1,6 @@
 import 'dotenv/config'; // ← убедись, что эта строка есть первой
 import { betterAuth } from 'better-auth';
+import { bearer } from 'better-auth/plugins';
 import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { Resend } from 'resend';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -26,7 +27,7 @@ export const auth = betterAuth({
   baseURL: process.env.BETTER_AUTH_URL,
   emailAndPassword: {
     enabled: true,
-    requireEmailVerification: true, // ← блокирует вход без верификации
+    // requireEmailVerification: true, // ← блокирует вход без верификации
     sendResetPassword: async ({ user, url }) => {
       void resend.emails.send({
         from: process.env.RESEND_FROM_EMAIL!,
@@ -69,4 +70,19 @@ export const auth = betterAuth({
       },
     },
   },
+  user: {
+    additionalFields: {
+      role: {
+        type: 'string',
+        required: false,
+        defaultValue: 'GUEST',
+        input: false, // ← критично! Пользователь НЕ может задать роль при регистрации
+      },
+    },
+  },
+  plugins: [bearer()],
+  advanced: {
+    disableOriginCheck: true, // ← только для dev!
+  },
+  //trustedOrigins: ['https://your-app.vercel.app'], чтобы Better Auth мог безопасно работать с запросами с этого домена
 });
