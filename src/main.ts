@@ -25,19 +25,28 @@ async function bootstrap() {
     next();
   });
 
-  // Сырой body ТОЛЬКО для /webhooks/* — ДО любых других парсеров
-  // Парсим ВСЁ на этом пути (безопасно: это выделенный webhook endpoint)
-  app.use(
-    '/webhooks',
-    express.raw({
-      type: '*/*',
-    }),
-  );
+  // Сырой body ТОЛЬКО для /webhooks/* — ручное чтение (надежнее express.raw)
+  app.use('/webhooks', (req: Request, res: Response, next: NextFunction) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const rawBody = Buffer.concat(chunks);
+      (req as any).rawBody = rawBody;
+      console.log('[DEBUG] Manual raw parser: read', rawBody.length, 'bytes');
+      next();
+    });
+    req.on('error', (err) => {
+      console.error('[DEBUG] Raw body read error:', err);
+      next(err);
+    });
+  });
 
-  // DEBUG: проверяем, что rawBody появился (используем any для доступа к rawBody)
+  // DEBUG: проверяем, что rawBody появился
   app.use('/webhooks', (req: Request, res: Response, next: NextFunction) => {
     const rawReq = req as any;
-    console.log('[DEBUG] After raw parser:', {
+    console.log('[DEBUG] After manual parser:', {
       hasRawBody: !!rawReq.rawBody,
       rawBodyLength: rawReq.rawBody?.length,
       rawBodyPreview: rawReq.rawBody?.toString?.().slice(0, 200),
