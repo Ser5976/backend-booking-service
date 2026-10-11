@@ -26,11 +26,11 @@ async function bootstrap() {
   });
 
   // Сырой body ТОЛЬКО для /webhooks/* — ДО любых других парсеров
-  // type: функция, матчит любой application/json (с charset и без)
+  // Парсим ВСЁ на этом пути (безопасно: это выделенный webhook endpoint)
   app.use(
     '/webhooks',
     express.raw({
-      type: (req) => req.headers['content-type']?.startsWith('application/json') ?? false,
+      type: '*/*',
     }),
   );
 
