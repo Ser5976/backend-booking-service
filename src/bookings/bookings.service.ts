@@ -83,4 +83,88 @@ export class BookingsService {
 
     return { url: session.url };
   }
+
+  /**
+   * Verify payment status by Checkout Session ID.
+   * Called from frontend success page as fallback if webhook didn't fire.
+   */
+  async verifyPaymentBySession(sessionId: string, userId: string): Promise<{
+    status: string;
+    booking?: any;
+    paymentStatus?: string;
+    message?: string;
+  }> {
+    // 1. Retrieve session from Stripe
+    const session = await this.stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['payment_intent'],
+    });
+
+    const bookingId = session.metadata?.bookingId;
+    if (!bookingId) {
+      throw new BadRequestException('Invalid session: no bookingId');
+    }
+
+    // 2. Verify ownership
+    const booking = await this.prisma.booking.findUnique({
+      where: { id: bookingId },
+    });
+
+    if (!booking || booking.guestId !== userId) {
+      throw new ForbiddenException('Not your booking');
+    }
+
+    // 3. If already confirmed, return early
+    if (booking.status === 'CONFIRMED') {
+      return { status: 'already_confirmed', booking };
+    }
+
+    // 4. Check Stripe payment status
+    const paymentIntent = session.payment_intent as Stripe.PaymentIntent | null;
+    const paymentStatus = paymentIntent?.status ?? session.payment_status; // 'paid', 'unpaid', 'no_payment_required'
+
+    if (paymentStatus === 'paid' || session.payment_status === 'paid') {
+      // 5. Update booking & payment (idempotent)
+      await this.prisma.$transaction(async (tx) => {
+        await tx.booking.update({
+          where: { id: bookingId },
+          data: {
+            status: 'CONFIRMED',
+            confirmedAt: new Date(),
+          },
+        });
+
+        const chargeId = paymentIntent?.latest_charge as string | null;
+        await tx.payment.updateMany({
+          where: { bookingId },
+          data: {
+            status: 'SUCCEEDED',
+            paidAt: new Date(),
+            stripeChargeId: chargeId ?? session.payment_intent as string,
+            stripeCustomerId: session.customer as string ?? undefined,
+            method: paymentIntent?.payment_method_types?.[0] ?? 'card',
+          },
+        });
+
+        await tx.notification.create({
+          data: {
+            userId: booking.guestId,
+            type: 'BOOKING_CONFIRMED',
+            channel: 'IN_APP',
+            title: 'Бронирование подтверждено',
+            body: `Ваша оплата прошла успешно. Бронь #${booking.code} подтверждена.`,
+            data: { bookingId: booking.id },
+          },
+        });
+      });
+
+      return { status: 'confirmed', booking };
+    }
+
+    // 6. Payment not succeeded yet
+    return {
+      status: 'pending',
+      paymentStatus,
+      message: 'Payment not completed yet',
+    };
+  }
 }
