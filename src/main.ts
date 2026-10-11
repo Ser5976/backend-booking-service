@@ -12,8 +12,14 @@ async function bootstrap() {
     credentials: true, // Разрешить отправку куки
   });
   app.enableShutdownHooks();
-  // Сырой body только для /webhooks/*
-  app.use('/webhooks', express.raw({ type: 'application/json' }));
+  // Сырой body ТОЛЬКО для /webhooks/* — ДО любых других парсеров
+  // type: функция, матчит любой application/json (с charset и без)
+  app.use(
+    '/webhooks',
+    express.raw({
+      type: (req) => req.headers['content-type']?.startsWith('application/json') ?? false,
+    }),
+  );
   await app.listen(process.env.PORT ?? 3000);
 }
 await bootstrap();
