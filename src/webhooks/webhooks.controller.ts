@@ -31,7 +31,7 @@ export class StripeWebhookController {
 
     try {
       event = this.stripe.webhooks.constructEvent(
-        req.rawBody!, // ← сырое тело запроса
+        req.rawBody!,
         signature,
         process.env.STRIPE_WEBHOOK_SECRET!,
       );
@@ -40,44 +40,42 @@ export class StripeWebhookController {
       throw new BadRequestException(`Webhook Error: ${message}`);
     }
 
-    // Обработка события
+    // 1. СНАЧАЛА отвечаем Stripe, что событие принято
+    // (не дожидаясь записи в БД)
+
+    // 2. ПОТОМ асинхронно обрабатываем (не блокируя ответ)
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as Stripe.Checkout.Session;
       const bookingId = session.metadata?.bookingId;
 
       if (bookingId) {
-        await this.prisma.booking.update({
-          where: { id: bookingId },
-          data: {
-            status: 'CONFIRMED',
-            confirmedAt: new Date(),
-          },
-        });
-
-        await this.prisma.payment.updateMany({
-          where: { bookingId },
-          data: {
-            status: 'SUCCEEDED',
-            paidAt: new Date(),
-            stripeChargeId: session.payment_intent as string,
-          },
+        // Запускаем обработку, но не ждем её завершения
+        this.processBookingConfirmation(bookingId, session).catch((err) => {
+          console.error('Failed to process booking confirmation:', err);
         });
       }
     }
 
-    // Идемпотентность: записываем событие, чтобы не обработать дважды
-    await this.prisma.stripeWebhookEvent.upsert({
-      where: { eventId: event.id },
-      update: { processed: true, processedAt: new Date() },
-      create: {
-        eventId: event.id,
-        type: event.type,
-        payload: event as any,
-        processed: true,
-        processedAt: new Date(),
-      },
+    // 3. Явно возвращаем 200, чтобы Stripe получил ответ
+    return { received: true };
+  }
+
+  private async processBookingConfirmation(
+    bookingId: string,
+    session: Stripe.Checkout.Session,
+  ) {
+    await this.prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'CONFIRMED', confirmedAt: new Date() },
     });
 
-    return { received: true };
+    await this.prisma.payment.updateMany({
+      where: { bookingId },
+      data: {
+        status: 'SUCCEEDED',
+        paidAt: new Date(),
+        stripeChargeId: session.payment_intent as string,
+      },
+    });
   }
 }

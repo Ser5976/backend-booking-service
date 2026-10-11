@@ -83,6 +83,12 @@ export const auth = betterAuth({
   plugins: [bearer()],
   advanced: {
     disableOriginCheck: true, // ← только для dev!
+    ipAddress: {
+      trustedProxies: ['0.0.0.0/0'], // доверяем всем прокси Render
+    },
   },
-  //trustedOrigins: ['https://your-app.vercel.app'], чтобы Better Auth мог безопасно работать с запросами с этого домена
+  trustedOrigins: [
+    'https://your-app.vercel.app',
+    'https://backend-booking-service-h2ey.onrender.com',
+  ],
 });
