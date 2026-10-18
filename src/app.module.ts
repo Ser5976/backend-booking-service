@@ -8,6 +8,7 @@ import { auth } from './auth.js';
 import { StripeService } from './stripe/stripe.service.js';
 import { BookingsModule } from './bookings/bookings.module.js';
 import { WebhooksModule } from './webhooks/webhooks.module.js';
+import { PropertiesModule } from './properties/properties.module.js';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     AuthModule.forRoot({ auth: auth }),
     BookingsModule,
     WebhooksModule,
+    PropertiesModule,
   ],
   controllers: [AppController],
   providers: [AppService, StripeService],
