@@ -38,6 +38,19 @@ export class PropertiesController {
     return this.service.findPublic(query);
   }
 
+  // ============================================================
+  // МОИ ОБЪЯВЛЕНИЯ (ХОСТ)
+  // ============================================================
+
+  /**
+   * Все объявления текущего хоста (все статусы, кроме архивированных).
+   */
+  @Get('my')
+  @Roles(['HOST', 'ADMIN'])
+  findMy(@Session() session: UserSession) {
+    return this.service.findMy(toActor(session.user));
+  }
+
   /**
    * Карточка объявления по id или slug.
    * Анонимно видит только PUBLISHED; владелец — свои любые;
@@ -48,6 +61,7 @@ export class PropertiesController {
    * замените параметр на @Session() session: UserSession | undefined
    * и оберните в try/catch, либо вынесите публичный эндпоинт отдельно.
    */
+
   @Get(':idOrSlug')
   @AllowAnonymous()
   findOne(
@@ -65,11 +79,11 @@ export class PropertiesController {
   /**
    * Все объявления текущего хоста (все статусы, кроме архивированных).
    */
-  @Get('my')
+  /* @Get('my')
   @Roles(['HOST', 'ADMIN'])
   findMy(@Session() session: UserSession) {
     return this.service.findMy(toActor(session.user));
-  }
+  } */
 
   // ============================================================
   // CRUD
