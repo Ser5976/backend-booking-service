@@ -9,6 +9,8 @@ import { StripeService } from './stripe/stripe.service.js';
 import { BookingsModule } from './bookings/bookings.module.js';
 import { WebhooksModule } from './webhooks/webhooks.module.js';
 import { PropertiesModule } from './properties/properties.module.js';
+import { ImagesModule } from './images/images.module.js';
+import { ImageKitModule } from './imagekit/imagekit.module.js';
 
 @Module({
   imports: [
@@ -18,6 +20,8 @@ import { PropertiesModule } from './properties/properties.module.js';
     BookingsModule,
     WebhooksModule,
     PropertiesModule,
+    ImagesModule,
+    ImageKitModule,
   ],
   controllers: [AppController],
   providers: [AppService, StripeService],
