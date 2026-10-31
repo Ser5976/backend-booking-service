@@ -11,17 +11,25 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
 import { PropertiesModule } from './properties/properties.module.js';
 import { ImagesModule } from './images/images.module.js';
 import { ImageKitModule } from './imagekit/imagekit.module.js';
+import { AvailabilityModule } from './availability/availability.module.js';
+import { PricingModule } from './pricing/pricing.module.js';
+import { ScheduleModule } from '@nestjs/schedule';
+import { TasksModule } from './tasks/tasks.module.js';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
     PrismaModule,
     AuthModule.forRoot({ auth: auth }),
     BookingsModule,
     WebhooksModule,
     PropertiesModule,
-    ImagesModule,
     ImageKitModule,
+    ImagesModule,
+    PricingModule,
+    AvailabilityModule,
+    TasksModule,
   ],
   controllers: [AppController],
   providers: [AppService, StripeService],
