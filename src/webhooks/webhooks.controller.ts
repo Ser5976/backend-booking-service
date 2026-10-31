@@ -114,7 +114,10 @@ export class StripeWebhookController {
         data: { processed: false, error: message },
       });
 
-      this.logger.error(`Failed to process event ${event.id}: ${message}`, stack);
+      this.logger.error(
+        `Failed to process event ${event.id}: ${message}`,
+        stack,
+      );
       // Re-throw so Stripe sees 5xx and retries
       throw new BadRequestException(`Processing failed: ${message}`);
     }
@@ -132,12 +135,18 @@ export class StripeWebhookController {
     }
 
     // Retrieve session with expanded payment_intent to get charge ID
-    const expandedSession = await this.stripe.checkout.sessions.retrieve(session.id, {
-      expand: ['payment_intent'],
-    });
+    const expandedSession = await this.stripe.checkout.sessions.retrieve(
+      session.id,
+      {
+        expand: ['payment_intent'],
+      },
+    );
 
-    const paymentIntent = expandedSession.payment_intent as Stripe.PaymentIntent | null;
+    const paymentIntent =
+      expandedSession.payment_intent as Stripe.PaymentIntent | null;
     const chargeId = paymentIntent?.latest_charge as string | null;
+    const paymentIntentId =
+      paymentIntent?.id ?? (expandedSession.payment_intent as string | null);
 
     await this.prisma.$transaction(async (tx) => {
       // Update booking status
@@ -155,8 +164,9 @@ export class StripeWebhookController {
         data: {
           status: 'SUCCEEDED',
           paidAt: new Date(),
-          stripeChargeId: chargeId ?? session.payment_intent as string,
-          stripeCustomerId: session.customer as string ?? undefined,
+          stripeChargeId: chargeId,
+          stripePaymentIntentId: paymentIntentId, // ← ключевое: сохраняем реальный pi_...
+          stripeCustomerId: (expandedSession.customer as string) ?? undefined,
           method: paymentIntent?.payment_method_types?.[0] ?? 'card',
         },
       });
@@ -173,7 +183,9 @@ export class StripeWebhookController {
         },
       });
 
-      this.logger.log(`Booking ${bookingId} confirmed via checkout.session.completed`);
+      this.logger.log(
+        `Booking ${bookingId} confirmed via checkout.session.completed`,
+      );
     });
   }
 
@@ -235,7 +247,8 @@ export class StripeWebhookController {
         where: { stripePaymentIntentId: paymentIntent.id },
         data: {
           status: 'FAILED',
-          failureReason: paymentIntent.last_payment_error?.message ?? 'Payment failed',
+          failureReason:
+            paymentIntent.last_payment_error?.message ?? 'Payment failed',
         },
       });
 
@@ -260,7 +273,9 @@ export class StripeWebhookController {
         });
       }
 
-      this.logger.log(`Payment failed for booking ${bookingId}: ${paymentIntent.last_payment_error?.message}`);
+      this.logger.log(
+        `Payment failed for booking ${bookingId}: ${paymentIntent.last_payment_error?.message}`,
+      );
     });
   }
 }
