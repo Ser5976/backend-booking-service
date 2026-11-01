@@ -15,6 +15,7 @@ import { AvailabilityModule } from './availability/availability.module.js';
 import { PricingModule } from './pricing/pricing.module.js';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TasksModule } from './tasks/tasks.module.js';
+import { ReviewsModule } from './reviews/reviews.module.js';
 
 @Module({
   imports: [
@@ -30,6 +31,7 @@ import { TasksModule } from './tasks/tasks.module.js';
     PricingModule,
     AvailabilityModule,
     TasksModule,
+    ReviewsModule,
   ],
   controllers: [AppController],
   providers: [AppService, StripeService],
