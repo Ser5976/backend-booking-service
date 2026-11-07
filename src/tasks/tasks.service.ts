@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { NotificationsService } from '../notifications/notifications.service.js';
 
 /**
  * Фоновые задачи. Запускаются раз в 6 часов (00:00, 06:00, 12:00, 18:00 UTC).
@@ -12,7 +13,7 @@ import { PrismaService } from '../prisma/prisma.service.js';
 @Injectable()
 export class TasksService {
   private readonly logger = new Logger(TasksService.name);
-
+  private readonly notifications: NotificationsService;
   constructor(private readonly prisma: PrismaService) {}
 
   /**
@@ -82,5 +83,9 @@ export class TasksService {
     this.logger.log(
       `Completed ${toComplete.length} finished booking(s) at ${now.toISOString()}`,
     );
+  }
+  @Cron('0 */6 * * *')
+  async sendPendingEmails() {
+    await this.notifications.sendPendingEmails();
   }
 }
