@@ -176,7 +176,7 @@ export class StripeWebhookController {
         data: {
           userId: booking.guestId,
           type: 'BOOKING_CONFIRMED',
-          channel: 'IN_APP',
+          channel: 'EMAIL',
           title: 'Бронирование подтверждено',
           body: `Ваша оплата прошла успешно. Бронь #${booking.code} подтверждена.`,
           data: { bookingId: booking.id },

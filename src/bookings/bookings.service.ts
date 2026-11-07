@@ -171,7 +171,7 @@ export class BookingsService {
             data: {
               userId: property.hostId,
               type: 'BOOKING_CREATED',
-              channel: 'IN_APP',
+              channel: 'EMAIL',
               title: 'Новая бронь',
               body: `Гость забронировал "${property.title}" на ${price.nights} ноч. Ожидает оплаты.`,
               data: { bookingId: booking.id },
@@ -570,7 +570,7 @@ export class BookingsService {
           data: {
             userId: booking.guestId,
             type: 'REFUND_PROCESSED',
-            channel: 'IN_APP',
+            channel: 'EMAIL',
             title: 'Бронь отменена',
             body: `Бронь #${booking.code} отменена. Возврат не может быть обработан автоматически, свяжитесь с поддержкой.`,
             data: { bookingId: booking.id },
