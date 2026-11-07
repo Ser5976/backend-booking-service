@@ -16,7 +16,7 @@ import { QueryBookingsDto } from './dto/query-bookings.dto.js';
 import { CancelBookingDto } from './dto/cancel-booking.dto.js';
 
 const BOOKING_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const PAYMENT_TIMEOUT_MINUTES = 15;
+const PAYMENT_TIMEOUT_MINUTES = 30;
 
 @Injectable()
 export class BookingsService {
