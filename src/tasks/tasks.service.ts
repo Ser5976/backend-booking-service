@@ -13,8 +13,11 @@ import { NotificationsService } from '../notifications/notifications.service.js'
 @Injectable()
 export class TasksService {
   private readonly logger = new Logger(TasksService.name);
-  private readonly notifications: NotificationsService;
-  constructor(private readonly prisma: PrismaService) {}
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService,
+  ) {}
 
   /**
    * PENDING → EXPIRED, если expiresAt < now.
