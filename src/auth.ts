@@ -1,5 +1,5 @@
 import 'dotenv/config'; // ← убедись, что эта строка есть первой
-import { betterAuth } from 'better-auth';
+import { APIError, betterAuth } from 'better-auth';
 import { bearer } from 'better-auth/plugins';
 import { prismaAdapter } from 'better-auth/adapters/prisma';
 import { Resend } from 'resend';
@@ -66,6 +66,23 @@ export const auth = betterAuth({
           } catch (error) {
             console.error('Failed to create Stripe customer:', error);
           }
+        },
+      },
+    },
+    session: {
+      create: {
+        before: async (session) => {
+          // Проверяем статус пользователя перед созданием сессии
+          const dbUser = await prisma.user.findUnique({
+            where: { id: session.userId },
+            select: { status: true },
+          });
+          if (dbUser?.status === 'DELETED' || dbUser?.status === 'SUSPENDED') {
+            throw new APIError('FORBIDDEN', {
+              message: 'Аккаунт заблокирован или удалён',
+            });
+          }
+          return { data: session };
         },
       },
     },

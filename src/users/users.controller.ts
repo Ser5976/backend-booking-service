@@ -1,9 +1,19 @@
-import { Body, Controller, Get, Param, Patch } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Patch,
+} from '@nestjs/common';
 import { AllowAnonymous, Session } from '@thallesp/nestjs-better-auth';
 import type { UserSession } from '@thallesp/nestjs-better-auth';
 
 import { UsersService } from './users.service.js';
 import { UpdateUserDto } from './dto/update-user.dto.js';
+import { DeleteAccountDto } from './dto/delete-account.dto.js';
 
 @Controller('users')
 export class UsersController {
@@ -33,5 +43,14 @@ export class UsersController {
   @AllowAnonymous()
   findPublic(@Param('id') id: string) {
     return this.service.findPublic(id);
+  }
+  /**
+   * Удаление своего профиля.
+   Soft delete (мягкое удаление)
+   */
+  @Delete('me')
+  @HttpCode(HttpStatus.OK)
+  deleteMe(@Body() dto: DeleteAccountDto, @Session() session: UserSession) {
+    return this.service.deleteMe(session.user.id);
   }
 }
