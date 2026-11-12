@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { UpdateUserDto } from './dto/update-user.dto.js';
+import { ConflictException } from '@nestjs/common';
 
 /** Публичные поля, которые можно отдавать всем */
 const PUBLIC_USER_SELECT = {
@@ -54,6 +55,7 @@ export class UsersService {
       where: { id: userId },
       select: {
         ...PUBLIC_USER_SELECT,
+        status: true, // ← добавили для проверки
         properties: {
           where: { status: 'PUBLISHED', deletedAt: null },
           select: {
@@ -80,8 +82,13 @@ export class UsersService {
       },
     });
 
-    if (!user) throw new NotFoundException('Пользователь не найден');
-    return user;
+    if (!user || user.status === 'DELETED') {
+      throw new NotFoundException('Пользователь не найден');
+    }
+
+    // Убираем status из ответа — фронтенду он не нужен
+    const { status, ...publicUser } = user;
+    return publicUser;
   }
 
   /**
@@ -118,5 +125,59 @@ export class UsersService {
         updatedAt: true,
       },
     });
+  }
+  /**
+   * Удаление своего профиля.
+   Soft delete (мягкое удаление)
+   */
+  async deleteMe(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, status: true },
+    });
+    if (!user) throw new NotFoundException('Пользователь не найден');
+    if (user.status === 'DELETED') {
+      return { ok: true }; // идемпотентно
+    }
+
+    // Проверяем активные брони как гость или хост
+    const activeBookings = await this.prisma.booking.count({
+      where: {
+        OR: [{ guestId: userId }, { hostId: userId }],
+        status: { in: ['PENDING', 'CONFIRMED'] },
+      },
+    });
+    if (activeBookings > 0) {
+      throw new ConflictException(
+        'Нельзя удалить аккаунт: есть активные брони. Отмените или дождитесь их завершения.',
+      );
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      // 1. Soft-delete пользователя + освобождаем email
+      await tx.user.update({
+        where: { id: userId },
+        data: {
+          status: 'DELETED',
+          deletedAt: new Date(),
+          email: `deleted-${userId}@deleted.local`,
+          emailVerified: false,
+        },
+      });
+
+      // 2. Архивируем объявления
+      await tx.property.updateMany({
+        where: { hostId: userId, deletedAt: null },
+        data: { status: 'ARCHIVED', deletedAt: new Date() },
+      });
+
+      // 3. Удаляем сессии (разлогиниваем везде)
+      await tx.session.deleteMany({ where: { userId } });
+
+      // 4. Удаляем OAuth/credential аккаунты
+      await tx.account.deleteMany({ where: { userId } });
+    });
+
+    return { ok: true };
   }
 }
