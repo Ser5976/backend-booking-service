@@ -18,6 +18,7 @@ import { TasksModule } from './tasks/tasks.module.js';
 import { ReviewsModule } from './reviews/reviews.module.js';
 import { NotificationsModule } from './notifications/notifications.module.js';
 import { UsersModule } from './users/users.module.js';
+import { AdminModule } from './admin/admin.module.js';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { UsersModule } from './users/users.module.js';
     ReviewsModule,
     NotificationsModule,
     UsersModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService, StripeService],
