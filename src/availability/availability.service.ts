@@ -27,11 +27,6 @@ export class AvailabilityService {
   // ПУБЛИЧНОЕ ЧТЕНИЕ КАЛЕНДАРЯ
   // ============================================================
 
-  /**
-   * Календарь дней [from, to] включительно.
-   * isAvailable = override.isAvailable (если задан) И отсутствие брони/override-false.
-   * price = override.priceOverride ИЛИ PricingService.
-   */
   async getCalendar(propertyId: string, query: QueryAvailabilityDto) {
     const property = await this.prisma.property.findUnique({
       where: { id: propertyId },
@@ -118,9 +113,6 @@ export class AvailabilityService {
     const dateKeys = [...new Set(dto.dates)].sort();
     this.assertValidDates(dateKeys);
 
-    // Проверка конфликтов с активными бронями и ручными блокировками
-    // (findUnavailableDatesInRange включает только брони и isAvailable:false;
-    // для update нам нужны только брони — блокировки перезаписывать можно)
     const booked = await this.findBookedDatesInRange(
       propertyId,
       dateKeys[0]!,
@@ -184,8 +176,8 @@ export class AvailabilityService {
 
   /**
    * Множество НЕДОСТУПНЫХ дат (yyyy-mm-dd) в [from, to].
-   * Включает активные брони (PENDING/CONFIRMED) и isAvailable:false.
-   * checkIn входит, checkOut — нет.
+   * Включает активные брони (CONFIRMED и PENDING с неистёкшим expiresAt)
+   * и isAvailable:false. checkIn входит, checkOut — нет.
    */
   async findUnavailableDatesInRange(
     propertyId: string,
@@ -194,11 +186,16 @@ export class AvailabilityService {
   ): Promise<Set<string>> {
     const result = new Set<string>();
 
-    // 1. Активные брони
+    // 1. Активные брони: CONFIRMED или PENDING с неистёкшим expiresAt.
+    //    «Протухшие» PENDING не должны блокировать даты до крона.
+    const now = new Date();
     const bookings = await this.prisma.booking.findMany({
       where: {
         propertyId,
-        status: { in: ['PENDING', 'CONFIRMED'] },
+        OR: [
+          { status: 'CONFIRMED' },
+          { status: 'PENDING', expiresAt: { gt: now } },
+        ],
         checkIn: { lt: this.parseDate(to) },
         checkOut: { gt: this.parseDate(from) },
       },
@@ -210,7 +207,7 @@ export class AvailabilityService {
       }
     }
 
-    // 2. Ручные блокировки
+    // 2. Ручные блокировки.
     const blocked = await this.prisma.availability.findMany({
       where: {
         propertyId,
@@ -228,17 +225,21 @@ export class AvailabilityService {
 
   /**
    * Множество ТОЛЬКО занятых бронями дат (yyyy-mm-dd) в [from, to].
-   * Используется в update (закрывать вручную заблокированные дни можно повторно).
+   * Используется в update. Учитывает PENDING с неистёкшим expiresAt.
    */
   private async findBookedDatesInRange(
     propertyId: string,
     from: string,
     to: string,
   ): Promise<Set<string>> {
+    const now = new Date();
     const bookings = await this.prisma.booking.findMany({
       where: {
         propertyId,
-        status: { in: ['PENDING', 'CONFIRMED'] },
+        OR: [
+          { status: 'CONFIRMED' },
+          { status: 'PENDING', expiresAt: { gt: now } },
+        ],
         checkIn: { lt: this.parseDate(to) },
         checkOut: { gt: this.parseDate(from) },
       },

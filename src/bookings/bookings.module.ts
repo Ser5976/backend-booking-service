@@ -4,9 +4,10 @@ import { BookingsController } from './bookings.controller.js';
 import { PrismaModule } from '../prisma/prisma.module.js';
 import { AvailabilityModule } from '../availability/availability.module.js';
 import { PricingModule } from '../pricing/pricing.module.js';
+import { StripeModule } from '../stripe/stripe.module.js';
 
 @Module({
-  imports: [PrismaModule, AvailabilityModule, PricingModule],
+  imports: [PrismaModule, AvailabilityModule, PricingModule, StripeModule],
   controllers: [BookingsController],
   providers: [BookingsService],
   exports: [BookingsService],

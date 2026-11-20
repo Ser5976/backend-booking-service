@@ -2,14 +2,15 @@ import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';
 import type { Request, Response, NextFunction } from 'express';
-import { ValidationPipe } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
+  const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule, {
     bodyParser: false,
   });
   app.enableCors({
-    origin: 'https://your-app.vercel.app',
+    origin: process.env.FRONTEND_URL,
     credentials: true,
   });
   app.enableShutdownHooks();
@@ -31,7 +32,8 @@ async function bootstrap() {
       transform: true,
     }),
   );
-
-  await app.listen(process.env.PORT ?? 3000);
+  const port = process.env.PORT ?? 3000;
+  await app.listen(port);
+  logger.log(`Server started on port ${port}`);
 }
 await bootstrap();
