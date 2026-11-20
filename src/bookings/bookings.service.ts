@@ -4,10 +4,13 @@ import {
   ForbiddenException,
   BadRequestException,
   ConflictException,
+  Logger,
 } from '@nestjs/common';
 
 import Stripe from 'stripe';
+import { Prisma, UserRole } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
+import { StripeService } from '../stripe/stripe.service.js';
 import { AvailabilityService } from '../availability/availability.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { CreateBookingDto } from './dto/create-booking.dto.js';
@@ -15,29 +18,48 @@ import { Actor } from '../common/auth/actor.js';
 import { QueryBookingsDto } from './dto/query-bookings.dto.js';
 import { CancelBookingDto } from './dto/cancel-booking.dto.js';
 
+// Алфавит для генерации кода брони.
+// Исключены похожие символы (0/O, 1/I/L), чтобы код было легко читать вслух.
 const BOOKING_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+// Сколько минут даётся гостю на оплату брони после её создания.
 const PAYMENT_TIMEOUT_MINUTES = 30;
+
+// Сколько попыток делаем при коллизии уникального кода брони (P2002).
+const BOOKING_CODE_RETRY_ATTEMPTS = 3;
+
+// Сколько дней до заезда даёт право на полный возврат (иначе — 50%).
+const FULL_REFUND_DAYS_BEFORE_CHECKIN = 3;
+
+// Терминальные статусы — оплата по ним не должна подтверждать бронь.
+const TERMINAL_STATUSES: readonly string[] = [
+  'EXPIRED',
+  'CANCELLED_BY_GUEST',
+  'CANCELLED_BY_HOST',
+];
 
 @Injectable()
 export class BookingsService {
+  private readonly logger = new Logger(BookingsService.name);
+
+  // Stripe-клиент инжектится из StripeService — единый экземпляр на приложение.
   private readonly stripe: Stripe;
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly stripeService: StripeService,
     private readonly availability: AvailabilityService,
     private readonly pricing: PricingService,
   ) {
-    this.stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
-      apiVersion: '2026-09-30.endive',
-    });
+    this.stripe = this.stripeService.client;
   }
 
   // ============================================================
-  // СОЗДАНИЕ БРОНИ
+  // 1. СОЗДАНИЕ БРОНИ
   // ============================================================
 
   async create(dto: CreateBookingDto, actor: Actor) {
-    // 1. Объявление должно существовать, быть опубликовано, не своё
+    // 1.1. Проверяем, что объявление существует и не удалено.
     const property = await this.prisma.property.findUnique({
       where: { id: dto.propertyId },
       include: {
@@ -57,7 +79,7 @@ export class BookingsService {
       );
     }
 
-    // 2. Базовая проверка дат
+    // 1.2. Базовая проверка дат.
     if (dto.checkIn >= dto.checkOut) {
       throw new BadRequestException('checkOut должен быть позже checkIn');
     }
@@ -66,7 +88,14 @@ export class BookingsService {
       throw new BadRequestException('Нельзя бронировать прошедшие даты');
     }
 
-    // 3. Быстрая проверка занятости (до транзакции)
+    // 1.3. Проверка вместимости (minNights/maxNights валидирует PricingService).
+    if (property.maxGuests && dto.guests > property.maxGuests) {
+      throw new BadRequestException(
+        `Максимум гостей для этого объявления — ${property.maxGuests}`,
+      );
+    }
+
+    // 1.4. Предварительная проверка занятости дат (вне транзакции).
     const unavailable = await this.availability.findUnavailableDatesInRange(
       dto.propertyId,
       dto.checkIn,
@@ -78,7 +107,7 @@ export class BookingsService {
       );
     }
 
-    // 4. Расчёт цены
+    // 1.5. Расчёт цены (PricingService валидирует minNights/maxNights).
     const price = await this.pricing.calculatePrice({
       propertyId: dto.propertyId,
       checkIn: dto.checkIn,
@@ -86,7 +115,7 @@ export class BookingsService {
       guests: dto.guests,
     });
 
-    // 5. Данные гостя для снапшота и Stripe customer_email
+    // 1.6. Данные гостя для снапшота и customer_email.
     const guest = await this.prisma.user.findUnique({
       where: { id: actor.id },
       select: { id: true, email: true, name: true },
@@ -95,7 +124,7 @@ export class BookingsService {
       throw new NotFoundException('Пользователь не найден');
     }
 
-    // 6. Снапшоты
+    // 1.7. Снапшоты — фиксируем состояние на момент бронирования.
     const propertySnapshot = {
       id: property.id,
       title: property.title,
@@ -114,12 +143,13 @@ export class BookingsService {
       name: guest.name,
     };
 
-    // 7. Транзакция: advisory lock → recheck → create → notify
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // 1.8. Транзакция с advisory lock и ретраем по P2002.
+    for (let attempt = 0; attempt < BOOKING_CODE_RETRY_ATTEMPTS; attempt++) {
       try {
         return await this.prisma.$transaction(async (tx) => {
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${dto.propertyId}))`;
 
+          // Повторная проверка пересечения дат внутри транзакции.
           const recheck = await tx.booking.findMany({
             where: {
               propertyId: dto.propertyId,
@@ -178,11 +208,23 @@ export class BookingsService {
             },
           });
 
+          this.logger.log(
+            `Booking created: id=${booking.id}, code=${booking.code}, total=${booking.totalAmount} ${booking.currency}`,
+          );
+
           return booking;
         });
-      } catch (e: any) {
-        // Коллизия по code — повторяем
-        if (e?.code === 'P2002' && attempt < 2) continue;
+      } catch (e: unknown) {
+        if (
+          e instanceof Prisma.PrismaClientKnownRequestError &&
+          e.code === 'P2002' &&
+          attempt < BOOKING_CODE_RETRY_ATTEMPTS - 1
+        ) {
+          this.logger.warn(
+            `Booking code collision, retry ${attempt + 1}/${BOOKING_CODE_RETRY_ATTEMPTS}`,
+          );
+          continue;
+        }
         throw e;
       }
     }
@@ -193,10 +235,11 @@ export class BookingsService {
   }
 
   // ============================================================
-  // STRIPE CHECKOUT
+  // 2. ОПЛАТА ЧЕРЕЗ STRIPE (CHECKOUT SESSION)
   // ============================================================
 
   async createCheckoutSession(bookingId: string, userId: string) {
+    // 2.1. Загружаем бронь вместе с объявлением.
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
       include: { property: true },
@@ -205,15 +248,50 @@ export class BookingsService {
     if (!booking) {
       throw new NotFoundException('Booking not found');
     }
-
     if (booking.guestId !== userId) {
       throw new ForbiddenException('You can only pay for your own bookings');
     }
-
     if (booking.status !== 'PENDING') {
       throw new BadRequestException('Booking is not awaiting payment');
     }
 
+    // 2.2. Ленивая проверка истечения (крон может ещё не успеть).
+    if (booking.expiresAt && booking.expiresAt < new Date()) {
+      await this.prisma.booking.update({
+        where: { id: booking.id },
+        data: { status: 'EXPIRED' },
+      });
+      this.logger.warn(`Booking ${booking.id} expired before payment`);
+      throw new BadRequestException('Срок оплаты брони истёк');
+    }
+
+    // 2.3. Сумма 0 (полная скидка) — Stripe не примет unit_amount=0.
+    if (booking.totalAmount <= 0) {
+      await this.prisma.$transaction(async (tx) => {
+        await tx.booking.update({
+          where: { id: booking.id },
+          data: { status: 'CONFIRMED', confirmedAt: new Date() },
+        });
+        await tx.notification.create({
+          data: {
+            userId: booking.guestId,
+            type: 'BOOKING_CONFIRMED',
+            channel: 'IN_APP',
+            title: 'Бронирование подтверждено',
+            body: `Бронь #${booking.code} подтверждена (бесплатное бронирование).`,
+            data: { bookingId: booking.id },
+          },
+        });
+      });
+      this.logger.log(
+        `Booking ${booking.id} confirmed without payment (totalAmount=0)`,
+      );
+      return { url: null, confirmed: true };
+    }
+
+    // 2.4. Создаём Stripe Checkout Session.
+    //      payment_intent_data.metadata — чтобы bookingId был доступен
+    //      в событии payment_intent.payment_failed (не только в session.metadata).
     const session = await this.stripe.checkout.sessions.create({
       mode: 'payment',
       line_items: [
@@ -230,34 +308,60 @@ export class BookingsService {
         },
       ],
       client_reference_id: booking.id,
-      customer_email: (booking.guestSnapshot as { email?: string } | null)
-        ?.email,
+      customer_email: this.extractGuestEmail(booking.guestSnapshot),
       success_url: `${process.env.FRONTEND_URL}/bookings/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL}/bookings/cancel`,
-      metadata: {
-        bookingId: booking.id,
-        guestId: userId,
+      metadata: { bookingId: booking.id, guestId: userId },
+      payment_intent_data: {
+        metadata: { bookingId: booking.id, guestId: userId },
       },
-      expires_at: Math.floor(Date.now() / 1000) + 30 * 60,
+      expires_at: Math.floor(Date.now() / 1000) + PAYMENT_TIMEOUT_MINUTES * 60,
     });
 
-    await this.prisma.payment.create({
-      data: {
-        bookingId: booking.id,
-        userId: userId,
-        amount: booking.totalAmount,
-        currency: booking.currency,
-        status: 'PENDING',
-        stripePaymentIntentId: session.payment_intent as string,
-        metadata: { checkoutSessionId: session.id },
-      },
+    const paymentIntentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : (session.payment_intent?.id ?? null);
+
+    // 2.5. Переиспользуем существующий PENDING payment, если он есть.
+    //      Иначе при двойном клике создадутся два платежа с null → @unique
+    //      на stripePaymentIntentId при последующем webhook.
+    const existingPending = await this.prisma.payment.findFirst({
+      where: { bookingId: booking.id, status: 'PENDING' },
+      orderBy: { createdAt: 'desc' },
     });
 
-    return { url: session.url };
+    if (existingPending) {
+      await this.prisma.payment.update({
+        where: { id: existingPending.id },
+        data: {
+          stripePaymentIntentId: paymentIntentId,
+          metadata: { checkoutSessionId: session.id },
+        },
+      });
+    } else {
+      await this.prisma.payment.create({
+        data: {
+          bookingId: booking.id,
+          userId,
+          amount: booking.totalAmount,
+          currency: booking.currency,
+          status: 'PENDING',
+          stripePaymentIntentId: paymentIntentId,
+          metadata: { checkoutSessionId: session.id },
+        },
+      });
+    }
+
+    this.logger.log(
+      `Checkout session created: bookingId=${booking.id}, sessionId=${session.id}, pi=${paymentIntentId ?? 'null'}`,
+    );
+
+    return { url: session.url, confirmed: false };
   }
 
   // ============================================================
-  // VERIFY PAYMENT (fallback для webhook)
+  // 3. ПРОВЕРКА ОПЛАТЫ (FALLBACK ДЛЯ WEBHOOK)
   // ============================================================
 
   async verifyPaymentBySession(
@@ -265,7 +369,7 @@ export class BookingsService {
     userId: string,
   ): Promise<{
     status: string;
-    booking?: any;
+    booking?: unknown;
     paymentStatus?: string;
     message?: string;
   }> {
@@ -290,43 +394,25 @@ export class BookingsService {
       return { status: 'already_confirmed', booking };
     }
 
+    // Оплата пришла, но бронь уже терминальная — возвращаем деньги.
+    if (TERMINAL_STATUSES.includes(booking.status)) {
+      this.logger.warn(
+        `Payment for terminal booking ${booking.id} (status=${booking.status}) — refunding`,
+      );
+      await this.refundLatePayment(booking.id, session);
+      throw new BadRequestException(
+        'Бронь уже недействительна. Оплата будет возвращена.',
+      );
+    }
+
     const paymentIntent = session.payment_intent as Stripe.PaymentIntent | null;
     const paymentStatus = paymentIntent?.status ?? session.payment_status;
 
     if (paymentStatus === 'paid' || session.payment_status === 'paid') {
-      await this.prisma.$transaction(async (tx) => {
-        await tx.booking.update({
-          where: { id: bookingId },
-          data: {
-            status: 'CONFIRMED',
-            confirmedAt: new Date(),
-          },
-        });
-
-        const chargeId = paymentIntent?.latest_charge as string | null;
-        await tx.payment.updateMany({
-          where: { bookingId },
-          data: {
-            status: 'SUCCEEDED',
-            paidAt: new Date(),
-            stripeChargeId: chargeId ?? (session.payment_intent as string),
-            stripeCustomerId: (session.customer as string) ?? undefined,
-            method: paymentIntent?.payment_method_types?.[0] ?? 'card',
-          },
-        });
-
-        await tx.notification.create({
-          data: {
-            userId: booking.guestId,
-            type: 'BOOKING_CONFIRMED',
-            channel: 'IN_APP',
-            title: 'Бронирование подтверждено',
-            body: `Ваша оплата прошла успешно. Бронь #${booking.code} подтверждена.`,
-            data: { bookingId: booking.id },
-          },
-        });
-      });
-
+      await this.confirmPaidBooking(booking.id, booking, session);
+      this.logger.log(
+        `Booking ${booking.id} confirmed via verifyPaymentBySession`,
+      );
       return { status: 'confirmed', booking };
     }
 
@@ -338,75 +424,81 @@ export class BookingsService {
   }
 
   // ============================================================
-  // ХЕЛПЕРЫ
-  // ============================================================
-
-  /**
-   * Человекочитаемый код брони: BK-2025-A3F9K2.
-   * Без похожих символов (0/O, 1/I/L), чтобы не путать при чтении вслух.
-   * Уникальность гарантируется @unique в БД + ретрай в create().
-   */
-  private generateBookingCode(): string {
-    const year = new Date().getUTCFullYear();
-    let suffix = '';
-    for (let i = 0; i < 6; i++) {
-      suffix +=
-        BOOKING_CODE_ALPHABET[
-          Math.floor(Math.random() * BOOKING_CODE_ALPHABET.length)
-        ];
-    }
-    return `BK-${year}-${suffix}`;
-  }
-
-  // ============================================================
-  // СПИСОК БРОНЕЙ
+  // 4. СПИСОК БРОНЕЙ
   // ============================================================
 
   /**
    * Список броней текущего пользователя.
-   * role=guest — где он гость; role=host — где он хост.
-   * Сортировка: ближайшие checkIn сверху; прошедшие — в конце.
+   * Будущие — сверху (по возрастанию checkIn), прошедшие — в конце (по убыванию).
    */
   async findMy(actor: Actor, query: QueryBookingsDto) {
     const role = query.role ?? 'guest';
-    const where: any = {
-      status: query.status ? query.status : undefined,
-    };
+    const where: Prisma.BookingWhereInput = {};
 
     if (role === 'guest') {
       where.guestId = actor.id;
     } else {
       where.hostId = actor.id;
     }
-
-    // Убираем undefined, чтобы Prisma не ругался
-    if (where.status === undefined) delete where.status;
+    if (query.status) {
+      where.status = query.status;
+    }
 
     const limit = query.limit ?? 20;
     const offset = query.offset ?? 0;
 
-    const [items, total] = await this.prisma.$transaction([
+    // Разделяем на будущие и прошедшие, чтобы отсортировать «ближайшие сверху».
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+
+    const upcomingWhere: Prisma.BookingWhereInput = {
+      ...where,
+      checkOut: { gte: today },
+    };
+    const pastWhere: Prisma.BookingWhereInput = {
+      ...where,
+      checkOut: { lt: today },
+    };
+
+    // 4.5. Сначала считаем totals — без циклической зависимости.
+    const [upcomingTotal, pastTotal] = await this.prisma.$transaction([
+      this.prisma.booking.count({ where: upcomingWhere }),
+      this.prisma.booking.count({ where: pastWhere }),
+    ]);
+
+    // 4.6. Сколько элементов нужно взять из каждой части.
+    //      Сначала заполняем upcoming (с учётом offset), остаток — из past.
+    const upcomingTake = Math.max(0, Math.min(limit, upcomingTotal - offset));
+    const pastOffset = Math.max(0, offset - upcomingTotal);
+    const pastTake = Math.max(0, limit - upcomingTake);
+
+    // 4.7. Забираем страницу.
+    const [upcomingItems, pastItems] = await this.prisma.$transaction([
       this.prisma.booking.findMany({
-        where,
+        where: upcomingWhere,
         orderBy: [{ checkIn: 'asc' }, { createdAt: 'desc' }],
         skip: offset,
-        take: limit,
-        include: {
-          property: {
-            select: {
-              id: true,
-              title: true,
-              slug: true,
-              city: true,
-              country: true,
-              images: { where: { isCover: true }, take: 1 },
-            },
-          },
-          review: { select: { id: true, ratingOverall: true } },
-        },
+        take: upcomingTake,
+        include: this.bookingListInclude(),
       }),
-      this.prisma.booking.count({ where }),
+      pastTake > 0
+        ? this.prisma.booking.findMany({
+            where: pastWhere,
+            orderBy: [{ checkIn: 'desc' }, { createdAt: 'desc' }],
+            skip: pastOffset,
+            take: pastTake,
+            include: this.bookingListInclude(),
+          })
+        : this.prisma.booking.findMany({
+            where: { id: '__never__' },
+            take: 0,
+            include: this.bookingListInclude(),
+          }),
     ]);
+
+    // 4.8. Склеиваем: сначала будущие, потом прошедшие.
+    const items = [...upcomingItems, ...pastItems];
+    const total = upcomingTotal + pastTotal;
 
     return {
       items,
@@ -418,13 +510,9 @@ export class BookingsService {
   }
 
   // ============================================================
-  // ДЕТАЛИ БРОНИ
+  // 5. ДЕТАЛИ БРОНИ
   // ============================================================
 
-  /**
-   * Детали одной брони. Доступ: гость, хост, админ.
-   * Включает property, payments, review.
-   */
   async findOne(bookingId: string, actor: Actor) {
     const booking = await this.prisma.booking.findUnique({
       where: { id: bookingId },
@@ -471,24 +559,38 @@ export class BookingsService {
       throw new NotFoundException('Бронь не найдена');
     }
 
-    const isGuest = booking.guestId === actor.id;
-    const isHost = booking.hostId === actor.id;
-    const isAdmin = actor.role === 'ADMIN';
+    this.assertCanAccess(booking, actor);
 
-    if (!isGuest && !isHost && !isAdmin) {
-      // 404, а не 403 — не палим существование чужой брони
-      throw new NotFoundException('Бронь не найдена');
+    // Пока бронь PENDING — скрываем точный адрес от гостя.
+    const isGuest = booking.guestId === actor.id;
+    const isAdmin = actor.role === UserRole.ADMIN;
+    if (isGuest && !isAdmin && booking.status === 'PENDING') {
+      return {
+        ...booking,
+        property: booking.property
+          ? {
+              ...booking.property,
+              street: null,
+              building: null,
+              apartment: null,
+            }
+          : null,
+      };
     }
 
     return booking;
   }
-  // src/bookings/bookings.service.ts (добавить)
+
+  // ============================================================
+  // 6. ОТМЕНА БРОНИ И ВОЗВРАТ СРЕДСТВ
+  // ============================================================
 
   /**
    * Отмена брони с возвратом через Stripe.
-   * - PENDING: без возврата.
-   * - CONFIRMED: возврат по правилам (полный/50%/100% при отмене хостом).
-   * - Прочие статусы: 400.
+   * - PENDING: без возврата (или EXPIRED, если срок уже истёк).
+   * - CONFIRMED: возврат по правилам.
+   * - После checkIn отмена запрещена.
+   * - Админ отменяет как гость (статус CANCELLED_BY_GUEST) + AuditLog.
    */
   async cancel(bookingId: string, dto: CancelBookingDto, actor: Actor) {
     const booking = await this.prisma.booking.findUnique({
@@ -504,45 +606,80 @@ export class BookingsService {
 
     if (!booking) throw new NotFoundException('Бронь не найдена');
 
+    this.assertCanAccess(booking, actor);
+
     const isGuest = booking.guestId === actor.id;
     const isHost = booking.hostId === actor.id;
-    const isAdmin = actor.role === 'ADMIN';
-    if (!isGuest && !isHost && !isAdmin) {
-      throw new NotFoundException('Бронь не найдена');
-    }
+    const isAdmin = actor.role === UserRole.ADMIN;
 
-    // Какие статусы можно отменить
-    const cancellable = ['PENDING', 'CONFIRMED'];
-    if (!cancellable.includes(booking.status)) {
+    // Отменить можно только PENDING или CONFIRMED.
+    if (!['PENDING', 'CONFIRMED'].includes(booking.status)) {
       throw new BadRequestException(
         `Нельзя отменить бронь в статусе ${booking.status}`,
       );
     }
 
-    // Определяем, кто отменяет
-    const cancelledBy: 'CANCELLED_BY_GUEST' | 'CANCELLED_BY_HOST' = isHost
-      ? 'CANCELLED_BY_HOST'
-      : 'CANCELLED_BY_GUEST';
-
-    // PENDING — без возврата
-    if (booking.status === 'PENDING') {
-      return this.prisma.booking.update({
-        where: { id: bookingId },
-        data: {
-          status: cancelledBy,
-          cancelledAt: new Date(),
-          cancellationReason: dto.reason ?? null,
-        },
-      });
+    // После заезда отмена запрещена.
+    const today = new Date();
+    today.setUTCHours(0, 0, 0, 0);
+    if (booking.checkIn < today) {
+      throw new BadRequestException('Нельзя отменить бронь после даты заезда');
     }
 
-    // CONFIRMED — считаем сумму возврата
-    const refundAmount = this.calculateRefundAmount(booking, isHost || isAdmin);
+    // Админ отменяет как гость (без отдельного статуса).
+    const cancelledBy: 'CANCELLED_BY_GUEST' | 'CANCELLED_BY_HOST' =
+      isHost && !isGuest && !isAdmin
+        ? 'CANCELLED_BY_HOST'
+        : 'CANCELLED_BY_GUEST';
 
-    // Ищем успешный платёж для Stripe Refund
+    // 6.1. PENDING — оплаты ещё не было.
+    if (booking.status === 'PENDING') {
+      const isExpired = booking.expiresAt && booking.expiresAt < new Date();
+      const newStatus = isExpired ? 'EXPIRED' : cancelledBy;
+
+      const updated = await this.prisma.booking.update({
+        where: { id: bookingId },
+        data: {
+          status: newStatus,
+          cancelledAt: isExpired ? null : new Date(),
+          cancellationReason: isExpired ? null : (dto.reason ?? null),
+        },
+      });
+
+      if (isAdmin) {
+        await this.prisma.auditLog.create({
+          data: {
+            actorId: actor.id,
+            action: 'booking.cancel',
+            entityType: 'Booking',
+            entityId: booking.id,
+            before: { status: booking.status },
+            after: { status: newStatus },
+          },
+        });
+      }
+
+      this.logger.log(
+        `Booking ${booking.id} (PENDING) cancelled as ${newStatus} by ${cancelledBy}${isAdmin ? ' (admin)' : ''}`,
+      );
+
+      return updated;
+    }
+
+    // 6.2. CONFIRMED — считаем возврат.
+    const refundAmount = this.calculateRefundAmount(booking, isHost);
+
     const payment = booking.payments[0];
-    if (!payment || !payment.stripePaymentIntentId) {
-      // Платёж не найден — отменяем без Stripe Refund
+
+    // 6.3. Нет платежа / нет PaymentIntent / сумма возврата <= 0 —
+    //      отменяем без Stripe Refund.
+    if (!payment || !payment.stripePaymentIntentId || refundAmount <= 0) {
+      const reasonText = !payment
+        ? 'No succeeded payment to refund'
+        : !payment.stripePaymentIntentId
+          ? 'PaymentIntent missing'
+          : 'Refund amount is zero';
+
       return this.prisma.$transaction(async (tx) => {
         const updated = await tx.booking.update({
           where: { id: bookingId },
@@ -553,18 +690,19 @@ export class BookingsService {
           },
         });
 
-        await tx.refund.create({
-          data: {
-            bookingId: booking.id,
-            paymentId: null,
-            amount: refundAmount,
-            currency: booking.currency,
-            status: 'REJECTED',
-            reason: dto.reason ?? 'No succeeded payment to refund',
-            adminNote:
-              'PaymentIntent not found — refund cannot be processed via Stripe',
-          },
-        });
+        if (refundAmount > 0) {
+          await tx.refund.create({
+            data: {
+              bookingId: booking.id,
+              paymentId: payment?.id ?? null,
+              amount: refundAmount,
+              currency: booking.currency,
+              status: 'REJECTED',
+              reason: dto.reason ?? reasonText,
+              adminNote: reasonText,
+            },
+          });
+        }
 
         await tx.notification.create({
           data: {
@@ -572,16 +710,36 @@ export class BookingsService {
             type: 'REFUND_PROCESSED',
             channel: 'EMAIL',
             title: 'Бронь отменена',
-            body: `Бронь #${booking.code} отменена. Возврат не может быть обработан автоматически, свяжитесь с поддержкой.`,
+            body:
+              refundAmount > 0
+                ? `Бронь #${booking.code} отменена. Возврат не может быть обработан автоматически (${reasonText}), свяжитесь с поддержкой.`
+                : `Бронь #${booking.code} отменена.`,
             data: { bookingId: booking.id },
           },
         });
+
+        if (isAdmin) {
+          await tx.auditLog.create({
+            data: {
+              actorId: actor.id,
+              action: 'booking.cancel',
+              entityType: 'Booking',
+              entityId: booking.id,
+              before: { status: booking.status },
+              after: { status: cancelledBy },
+            },
+          });
+        }
+
+        this.logger.warn(
+          `Booking ${booking.id} cancelled without Stripe refund: ${reasonText}`,
+        );
 
         return updated;
       });
     }
 
-    // Создаём Stripe Refund
+    // 6.4. Пытаемся создать возврат в Stripe.
     let stripeRefund: Stripe.Refund | null = null;
     let stripeError: string | null = null;
     try {
@@ -589,16 +747,16 @@ export class BookingsService {
         payment_intent: payment.stripePaymentIntentId,
         amount: refundAmount,
         reason: 'requested_by_customer',
-        metadata: {
-          bookingId: booking.id,
-          cancelledBy,
-        },
+        metadata: { bookingId: booking.id, cancelledBy },
       });
-    } catch (e: any) {
-      stripeError = e?.message ?? 'Unknown Stripe error';
+    } catch (e: unknown) {
+      stripeError = e instanceof Error ? e.message : 'Unknown Stripe error';
+      this.logger.error(
+        `Stripe refund failed for booking ${booking.id}: ${stripeError}`,
+      );
     }
 
-    // Обновляем БД в транзакции
+    // 6.5. Обновляем БД в одной транзакции.
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.booking.update({
         where: { id: bookingId },
@@ -609,13 +767,11 @@ export class BookingsService {
         },
       });
 
-      // Refund
-
       const refundStatus = stripeError
         ? 'REJECTED'
         : stripeRefund?.status === 'succeeded'
           ? 'PROCESSED'
-          : 'REQUESTED'; // pending или requires_action
+          : 'REQUESTED'; // pending/requires_action → обновит webhook refund.updated
 
       const refundRecord = await tx.refund.create({
         data: {
@@ -631,7 +787,6 @@ export class BookingsService {
         },
       });
 
-      // Payment
       if (!stripeError) {
         const isFullRefund = refundAmount >= booking.totalAmount;
         await tx.payment.update({
@@ -642,7 +797,6 @@ export class BookingsService {
         });
       }
 
-      // Уведомление гостю
       await tx.notification.create({
         data: {
           userId: booking.guestId,
@@ -653,12 +807,11 @@ export class BookingsService {
             : 'Бронь отменена',
           body: stripeError
             ? `Бронь #${booking.code} отменена. Возврат не удался: ${stripeError}. Свяжитесь с поддержкой.`
-            : `Бронь #${booking.code} отменена. Возврат ${refundAmount / 100} ${booking.currency} обработан.`,
+            : `Бронь #${booking.code} отменена. Возврат ${this.formatAmount(refundAmount, booking.currency)} обработан.`,
           data: { bookingId: booking.id, refundId: refundRecord.id },
         },
       });
 
-      // Уведомление хосту (если отменил гость)
       if (cancelledBy === 'CANCELLED_BY_GUEST') {
         await tx.notification.create({
           data: {
@@ -672,21 +825,275 @@ export class BookingsService {
         });
       }
 
+      if (isAdmin) {
+        await tx.auditLog.create({
+          data: {
+            actorId: actor.id,
+            action: 'booking.cancel',
+            entityType: 'Booking',
+            entityId: booking.id,
+            before: { status: booking.status },
+            after: { status: cancelledBy },
+          },
+        });
+      }
+
+      this.logger.log(
+        `Booking ${booking.id} cancelled as ${cancelledBy}${isAdmin ? ' (admin)' : ''}, refund=${refundAmount} ${booking.currency}, status=${refundStatus}`,
+      );
+
       return updated;
     });
   }
 
+  // ============================================================
+  // 7. ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+  // ============================================================
+
+  private assertCanAccess(
+    booking: { guestId: string; hostId: string },
+    actor: Actor,
+  ): void {
+    const allowed =
+      booking.guestId === actor.id ||
+      booking.hostId === actor.id ||
+      actor.role === UserRole.ADMIN;
+    if (!allowed) {
+      throw new NotFoundException('Бронь не найдена');
+    }
+  }
+
+  private bookingListInclude(): Prisma.BookingInclude {
+    return {
+      property: {
+        select: {
+          id: true,
+          title: true,
+          slug: true,
+          city: true,
+          country: true,
+          images: { where: { isCover: true }, take: 1 },
+        },
+      },
+      review: { select: { id: true, ratingOverall: true } },
+    };
+  }
+
+  private extractGuestEmail(
+    snapshot: Prisma.JsonValue | null,
+  ): string | undefined {
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      return undefined;
+    }
+    const email = (snapshot as { email?: unknown }).email;
+    return typeof email === 'string' ? email : undefined;
+  }
+
+  private formatAmount(amount: number, currency: string): string {
+    try {
+      return new Intl.NumberFormat('ru-RU', {
+        style: 'currency',
+        currency,
+      }).format(amount / 100);
+    } catch {
+      return `${amount / 100} ${currency}`;
+    }
+  }
+
+  private generateBookingCode(): string {
+    const year = new Date().getUTCFullYear();
+    let suffix = '';
+    for (let i = 0; i < 6; i++) {
+      suffix +=
+        BOOKING_CODE_ALPHABET[
+          Math.floor(Math.random() * BOOKING_CODE_ALPHABET.length)
+        ];
+    }
+    return `BK-${year}-${suffix}`;
+  }
+
+  /**
+   * Подтверждает оплаченную бронь: обновляет booking + payment,
+   * создаёт платёж, если его не было, и уведомляет гостя.
+   * Обновление payment идёт по checkoutSessionId из metadata,
+   * чтобы не задеть чужой платёж при двух сессиях.
+   */
+  private async confirmPaidBooking(
+    bookingId: string,
+    booking: {
+      id: string;
+      guestId: string;
+      code: string;
+      totalAmount: number;
+      currency: string;
+    },
+    session: Stripe.Checkout.Session,
+  ): Promise<void> {
+    const paymentIntent = session.payment_intent as Stripe.PaymentIntent | null;
+    const chargeId = (paymentIntent?.latest_charge as string | null) ?? null;
+    const paymentIntentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : (paymentIntent?.id ?? null);
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.booking.update({
+        where: { id: bookingId },
+        data: { status: 'CONFIRMED', confirmedAt: new Date() },
+      });
+
+      // Обновляем платёж, привязанный именно к этой checkout-сессии.
+      const updated = await tx.payment.updateMany({
+        where: {
+          bookingId,
+          metadata: { path: ['checkoutSessionId'], equals: session.id },
+        },
+        data: {
+          status: 'SUCCEEDED',
+          paidAt: new Date(),
+          stripeChargeId: chargeId ?? paymentIntentId,
+          stripePaymentIntentId: paymentIntentId,
+          stripeCustomerId: (session.customer as string) ?? undefined,
+          method: paymentIntent?.payment_method_types?.[0] ?? 'card',
+        },
+      });
+
+      // Если платежа не было (createCheckoutSession упал после Stripe) — создаём.
+      if (updated.count === 0) {
+        await tx.payment.create({
+          data: {
+            bookingId,
+            userId: booking.guestId,
+            amount: booking.totalAmount,
+            currency: booking.currency,
+            status: 'SUCCEEDED',
+            paidAt: new Date(),
+            stripePaymentIntentId: paymentIntentId,
+            stripeChargeId: chargeId ?? paymentIntentId,
+            stripeCustomerId: (session.customer as string) ?? undefined,
+            method: paymentIntent?.payment_method_types?.[0] ?? 'card',
+            metadata: { checkoutSessionId: session.id, recovered: true },
+          },
+        });
+      }
+
+      await tx.notification.create({
+        data: {
+          userId: booking.guestId,
+          type: 'BOOKING_CONFIRMED',
+          channel: 'IN_APP',
+          title: 'Бронирование подтверждено',
+          body: `Ваша оплата прошла успешно. Бронь #${booking.code} подтверждена.`,
+          data: { bookingId },
+        },
+      });
+    });
+  }
+
+  /**
+   * Возврат денег за позднюю оплату терминальной брони.
+   */
+  private async refundLatePayment(
+    bookingId: string,
+    session: Stripe.Checkout.Session,
+  ): Promise<void> {
+    const paymentIntentId =
+      typeof session.payment_intent === 'string'
+        ? session.payment_intent
+        : ((session.payment_intent as Stripe.PaymentIntent | null)?.id ?? null);
+
+    if (!paymentIntentId) {
+      this.logger.error(
+        `Cannot refund late payment for booking ${bookingId}: no payment_intent`,
+      );
+      return;
+    }
+
+    try {
+      const refund = await this.stripe.refunds.create({
+        payment_intent: paymentIntentId,
+        reason: 'requested_by_customer',
+        metadata: {
+          bookingId,
+          reason: 'late_payment_for_terminal_booking',
+        },
+      });
+
+      await this.prisma.$transaction(async (tx) => {
+        const payment = await tx.payment.findFirst({
+          where: { bookingId, stripePaymentIntentId: paymentIntentId },
+        });
+
+        await tx.refund.create({
+          data: {
+            bookingId,
+            paymentId: payment?.id ?? null,
+            stripeRefundId: refund.id,
+            amount: refund.amount,
+            currency: refund.currency.toUpperCase(),
+            status: refund.status === 'succeeded' ? 'PROCESSED' : 'REQUESTED',
+            reason: 'late_payment_for_terminal_booking',
+            processedAt: refund.status === 'succeeded' ? new Date() : null,
+          },
+        });
+
+        if (payment) {
+          await tx.payment.update({
+            where: { id: payment.id },
+            data: {
+              status:
+                refund.amount >= payment.amount
+                  ? 'REFUNDED'
+                  : 'PARTIALLY_REFUNDED',
+            },
+          });
+        }
+
+        const booking = await tx.booking.findUnique({
+          where: { id: bookingId },
+        });
+        if (booking) {
+          await tx.notification.create({
+            data: {
+              userId: booking.guestId,
+              type: 'REFUND_PROCESSED',
+              channel: 'IN_APP',
+              title: 'Оплата возвращена',
+              body: `Бронь #${booking.code} уже была недействительна. Оплата возвращена.`,
+              data: { bookingId },
+            },
+          });
+        }
+      });
+
+      this.logger.log(
+        `Late payment refunded: bookingId=${bookingId}, refundId=${refund.id}`,
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Unknown Stripe error';
+      this.logger.error(
+        `Failed to refund late payment for booking ${bookingId}: ${msg}`,
+      );
+    }
+  }
+
+  // ============================================================
+  // 8. РАСЧЁТ ВОЗВРАТА
+  // ============================================================
+
   /**
    * Сумма возврата:
-   * - Хост/админ отменяет → 100% totalAmount.
+   * - Хост отменяет → 100% totalAmount.
    * - Гость, checkIn - today >= 3 дня → 100%.
    * - Гость, меньше 3 дней → 50% (округление вниз).
+   * - Админ отменяет как гость (см. cancel).
+   * TODO: уточнить у бизнеса, возвращается ли serviceFee/taxes при отмене хостом.
    */
   private calculateRefundAmount(
     booking: { totalAmount: number; checkIn: Date },
-    isHostOrAdmin: boolean,
+    isHost: boolean,
   ): number {
-    if (isHostOrAdmin) return booking.totalAmount;
+    if (isHost) return booking.totalAmount;
 
     const today = new Date();
     today.setUTCHours(0, 0, 0, 0);
@@ -697,7 +1104,9 @@ export class BookingsService {
       (checkIn.getTime() - today.getTime()) / (1000 * 60 * 60 * 24),
     );
 
-    if (daysUntilCheckIn >= 3) return booking.totalAmount;
+    if (daysUntilCheckIn >= FULL_REFUND_DAYS_BEFORE_CHECKIN) {
+      return booking.totalAmount;
+    }
     return Math.floor(booking.totalAmount * 0.5);
   }
 }

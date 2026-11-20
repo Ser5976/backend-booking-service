@@ -9,6 +9,9 @@ import { NotificationsService } from '../notifications/notifications.service.js'
  * На бесплатном Render — сервис засыпает через 15 мин без HTTP-трафика,
  * поэтому крон не срабатывает, пока сервис спит. При первом запросе
  * после пробуждения следующий крон выполнится в ближайший слот.
+ *
+ * ВАЖНО: ленивая проверка expiresAt есть в BookingsService.createCheckoutSession
+ * и BookingsService.cancel — она закрывает случаи, когда крон не успел.
  */
 @Injectable()
 export class TasksService {
@@ -21,33 +24,61 @@ export class TasksService {
 
   /**
    * PENDING → EXPIRED, если expiresAt < now.
-   * Освобождает даты в календаре.
+   * Освобождает даты, уведомляет гостя, помечает платёж FAILED.
    */
   @Cron('0 */6 * * *')
   async expirePendingBookings() {
     const now = new Date();
 
-    const result = await this.prisma.booking.updateMany({
+    const toExpire = await this.prisma.booking.findMany({
       where: {
         status: 'PENDING',
         expiresAt: { lt: now, not: null },
       },
-      data: {
-        status: 'EXPIRED',
-      },
+      select: { id: true, guestId: true, code: true },
     });
 
-    if (result.count > 0) {
-      this.logger.log(
-        `Expired ${result.count} pending booking(s) at ${now.toISOString()}`,
-      );
-    }
+    if (toExpire.length === 0) return;
+
+    await this.prisma.$transaction([
+      // Ещё раз фильтруем по status: 'PENDING' — защита от гонки с webhook.
+      this.prisma.booking.updateMany({
+        where: {
+          id: { in: toExpire.map((b) => b.id) },
+          status: 'PENDING',
+        },
+        data: { status: 'EXPIRED' },
+      }),
+      this.prisma.payment.updateMany({
+        where: {
+          bookingId: { in: toExpire.map((b) => b.id) },
+          status: 'PENDING',
+        },
+        data: {
+          status: 'FAILED',
+          failureReason: 'Payment timeout',
+        },
+      }),
+      this.prisma.notification.createMany({
+        data: toExpire.map((b) => ({
+          userId: b.guestId,
+          type: 'PAYMENT_FAILED',
+          channel: 'IN_APP',
+          title: 'Срок оплаты истек',
+          body: `Время на оплату брони #${b.code} истекло. Бронь отменена.`,
+          data: { bookingId: b.id },
+        })),
+      }),
+    ]);
+
+    this.logger.log(
+      `Expired ${toExpire.length} pending booking(s) at ${now.toISOString()}`,
+    );
   }
 
   /**
    * CONFIRMED → COMPLETED, если checkOut < сегодня.
-   * checkOut — день выезда; завершаем на следующий день.
-   * Уведомляет гостя о возможности оставить отзыв.
+   * Уведомляет гостя о возможности оставить отзыв (только если отзыва ещё нет).
    */
   @Cron('0 */6 * * *')
   async completeFinishedBookings() {
@@ -60,6 +91,7 @@ export class TasksService {
       where: {
         status: 'CONFIRMED',
         checkOut: { lt: today },
+        review: null, // не спамим тех, кто уже оставил отзыв
       },
       select: { id: true, guestId: true, code: true },
     });
@@ -68,7 +100,10 @@ export class TasksService {
 
     await this.prisma.$transaction([
       this.prisma.booking.updateMany({
-        where: { id: { in: toComplete.map((b) => b.id) } },
+        where: {
+          id: { in: toComplete.map((b) => b.id) },
+          status: 'CONFIRMED', // защита от гонки с cancel
+        },
         data: { status: 'COMPLETED', completedAt: now },
       }),
       this.prisma.notification.createMany({
@@ -87,6 +122,7 @@ export class TasksService {
       `Completed ${toComplete.length} finished booking(s) at ${now.toISOString()}`,
     );
   }
+
   @Cron('0 */6 * * *')
   async sendPendingEmails() {
     await this.notifications.sendPendingEmails();
