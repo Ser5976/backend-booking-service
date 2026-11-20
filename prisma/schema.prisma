@@ -49,8 +49,8 @@ enum PropertyStatus {
 enum BookingStatus {
   PENDING          // создано, ждёт оплаты
   CONFIRMED        // оплачено, активно
-  CANCELLED_BY_GUEST
-  CANCELLED_BY_HOST
+  CANCELLED_BY_GUEST // отменено гостем
+  CANCELLED_BY_HOST // отменено хозяином
   COMPLETED        // проживание завершено
   EXPIRED          // не оплачено вовремя
   NO_SHOW
