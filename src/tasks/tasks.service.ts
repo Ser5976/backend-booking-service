@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service.js';
 import { NotificationsService } from '../notifications/notifications.service.js';
+import { PayoutsService } from '../payouts/payouts.service.js';
 
 /**
  * Фоновые задачи. Запускаются раз в 6 часов (00:00, 06:00, 12:00, 18:00 UTC).
@@ -20,11 +21,17 @@ export class TasksService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
+    private readonly payouts: PayoutsService,
   ) {}
 
   /**
    * PENDING → EXPIRED, если expiresAt < now.
    * Освобождает даты, уведомляет гостя, помечает платёж FAILED.
+   *
+   * Крон: раз в 6 часов.
+   * Почему 6 часов: компромисс между «быстро освободить даты» и
+   * «не дёргать бесплатный Neon слишком часто». Ленивая проверка
+   * в createCheckoutSession/cancel закрывает срочные случаи.
    */
   @Cron('0 */6 * * *')
   async expirePendingBookings() {
@@ -79,6 +86,10 @@ export class TasksService {
   /**
    * CONFIRMED → COMPLETED, если checkOut < сегодня.
    * Уведомляет гостя о возможности оставить отзыв (только если отзыва ещё нет).
+   *
+   * Крон: раз в 6 часов.
+   * Завершаем на следующий день после checkOut — гость выезжает утром,
+   * и только после этого бронь считается завершённой.
    */
   @Cron('0 */6 * * *')
   async completeFinishedBookings() {
@@ -123,6 +134,61 @@ export class TasksService {
     );
   }
 
+  /**
+   * Создаёт Payout для COMPLETED броней, у которых его ещё нет.
+   * Идемпотентно: повторный вызов для той же брони не создаст дубль.
+   *
+   * Крон: раз в 6 часов.
+   * Запускается после completeFinishedBookings (в том же тике), но
+   * порядок в @nestjs/schedule не гарантирован. Поэтому здесь
+   * ищем все COMPLETED без Payout — независимо от того, кто их завершил.
+   *
+   * Почему не в completeFinishedBookings:
+   * - Разделение ответственности: завершение брони и финансы — разные задачи.
+   * - Если создание Payout упадёт, завершение брони всё равно пройдёт.
+   * - Легче тестировать отдельно.
+   */
+  @Cron('0 */6 * * *')
+  async createPayoutsForCompletedBookings() {
+    // Находим COMPLETED брони без Payout.
+    // Prisma не умеет «нет связанных» напрямую, поэтому два запроса:
+    // 1) все COMPLETED, 2) у кого уже есть Payout — исключаем.
+    const completed = await this.prisma.booking.findMany({
+      where: { status: 'COMPLETED' },
+      select: { id: true },
+    });
+
+    if (completed.length === 0) return;
+
+    const existingPayouts = await this.prisma.payout.findMany({
+      where: { bookingId: { in: completed.map((b) => b.id) } },
+      select: { bookingId: true },
+    });
+    const withPayout = new Set(
+      existingPayouts.map((p) => p.bookingId).filter(Boolean) as string[],
+    );
+
+    const toProcess = completed.filter((b) => !withPayout.has(b.id));
+
+    if (toProcess.length === 0) return;
+
+    for (const booking of toProcess) {
+      await this.payouts.createForCompletedBooking(booking.id);
+    }
+
+    this.logger.log(
+      `Created ${toProcess.length} payout(s) for completed bookings`,
+    );
+  }
+
+  /**
+   * Отправляет все EMAIL-уведомления, которые ещё не отправлены.
+   * Вызывается из NotificationsService (батч по 50).
+   *
+   * Крон: раз в 6 часов.
+   * Почему не чаще: Resend имеет лимиты на бесплатном плане,
+   * а уведомления не критичны к задержке в несколько часов.
+   */
   @Cron('0 */6 * * *')
   async sendPendingEmails() {
     await this.notifications.sendPendingEmails();
