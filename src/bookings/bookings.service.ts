@@ -144,16 +144,24 @@ export class BookingsService {
     };
 
     // 1.8. Транзакция с advisory lock и ретраем по P2002.
+    // pg_advisory_xact_lock(hashtext(propertyId)) гарантирует,
+    // что два параллельных create() на одно объявление выполняются последовательно.
+    // Первый создаёт бронь, второй видит её в recheck и падает с 409.
+    // Без лока была бы гонка: оба прошли бы recheck, оба создали бы бронь — и получили бы пересечение.
     for (let attempt = 0; attempt < BOOKING_CODE_RETRY_ATTEMPTS; attempt++) {
       try {
         return await this.prisma.$transaction(async (tx) => {
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${dto.propertyId}))`;
+          const now = new Date();
 
           // Повторная проверка пересечения дат внутри транзакции.
           const recheck = await tx.booking.findMany({
             where: {
               propertyId: dto.propertyId,
-              status: { in: ['PENDING', 'CONFIRMED'] },
+              OR: [
+                { status: 'CONFIRMED' },
+                { status: 'PENDING', expiresAt: { gt: now } },
+              ],
               checkIn: { lt: new Date(`${dto.checkOut}T00:00:00.000Z`) },
               checkOut: { gt: new Date(`${dto.checkIn}T00:00:00.000Z`) },
             },
