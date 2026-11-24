@@ -53,7 +53,6 @@ enum BookingStatus {
   CANCELLED_BY_HOST // отменено хозяином
   COMPLETED        // проживание завершено
   EXPIRED          // не оплачено вовремя
-  NO_SHOW
 }
 
 enum PaymentStatus {
