@@ -23,6 +23,7 @@ import { NotificationsModule } from './notifications/notifications.module.js';
 import { UsersModule } from './users/users.module.js';
 import { AdminModule } from './admin/admin.module.js';
 import { PayoutsModule } from './payouts/payouts.module.js';
+import { FavoritesModule } from './favorites/favorites.module.js';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { PayoutsModule } from './payouts/payouts.module.js';
     UsersModule,
     AdminModule,
     PayoutsModule,
+    FavoritesModule,
   ],
   controllers: [AppController],
   providers: [AppService, { provide: APP_GUARD, useClass: ThrottlerGuard }],
